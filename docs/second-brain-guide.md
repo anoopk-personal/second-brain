@@ -6,6 +6,30 @@ A step-by-step guide to building a personal knowledge capture and retrieval syst
 
 ---
 
+## What You'll Build
+
+By the end of this guide you will have:
+
+- A **Slack channel** where you type thoughts and they are automatically saved with semantic embeddings and AI-extracted metadata (type, topics, people, action items).
+- A **searchable knowledge base** in Supabase (pgvector) that you can query by meaning, not just keywords.
+- An **MCP server** that connects your knowledge base to any AI tool -- Claude, ChatGPT, Cursor, and others -- so you can say "search my second brain for..." and get results mid-conversation.
+
+Total setup time: 30-60 minutes. Ongoing cost: under $0.30/month for typical use.
+
+---
+
+## Prerequisites
+
+- **Supabase account** -- [supabase.com](https://supabase.com) (free tier works)
+- **Slack workspace** where you can install apps
+- **OpenRouter account** -- [openrouter.ai](https://openrouter.ai) (pay-as-you-go, a few dollars covers months of use)
+- **Supabase CLI** -- [install instructions](https://supabase.com/docs/guides/cli/getting-started)
+- **Node.js 18+** -- required for `npx` commands and the `mcp-remote` bridge
+- **Terminal access** -- all deployment commands run from the terminal
+- **openssl** -- pre-installed on macOS and most Linux distros (used to generate the MCP access key)
+
+---
+
 ## Before You Start
 
 Print or copy this credential tracker. Fill in each value as you complete the corresponding step.
@@ -477,6 +501,17 @@ Deno.serve(async (req: Request): Promise<Response> => {
       messageText = messageText.slice(0, MAX_INPUT_LENGTH);
     }
 
+    // Deduplicate Slack retries (Slack resends if no response within 3 seconds)
+    const { data: existing } = await supabase
+      .from("thoughts")
+      .select("id")
+      .contains("metadata", { slack_ts: messageTs })
+      .limit(1);
+
+    if (existing && existing.length > 0) {
+      return new Response("ok", { status: 200 });
+    }
+
     // Generate embedding and extract metadata in parallel
     const [embedding, metadata] = await Promise.all([
       getEmbedding(messageText),
@@ -860,7 +895,7 @@ server.registerTool(
   "thought_stats",
   {
     title: "Thought Statistics",
-    description: "Get a summary of all captured thoughts: totals, types, top topics, and people.",
+    description: "Get a summary of all captured thoughts: totals, types, top topics, and people. Type and topic breakdowns are based on the most recent 1,000 thoughts.",
     inputSchema: {},
   },
   async () => {
@@ -1086,6 +1121,8 @@ claude mcp add second-brain \
 5. Header: `x-brain-key: YOUR_MCP_ACCESS_KEY`.
 6. Save.
 
+> **Note:** ChatGPT's MCP support is evolving. If the exact menu path above has changed, look for MCP, custom tools, or connector configuration in ChatGPT's Settings.
+
 #### Other MCP clients (Cursor, VS Code Copilot, Windsurf)
 
 These clients do not natively support remote MCP servers. Use the `mcp-remote` bridge.
@@ -1141,6 +1178,11 @@ All pricing is based on OpenRouter's pass-through rates for the models used.
 
 Supabase free tier includes 500 MB database, 500K Edge Function invocations, and 2 GB bandwidth per month. This is more than sufficient for personal use.
 
+> **Model dependency:** Both edge functions use `openai/text-embedding-3-small` (1536 dimensions) for embeddings
+> and `openai/gpt-4o-mini` for metadata extraction, routed through OpenRouter. If these models become unavailable
+> or change on OpenRouter, update the model names in both edge functions and redeploy. Changing the embedding model
+> requires re-embedding all existing thoughts (see Appendix C).
+
 ---
 
 ## Appendix B: Troubleshooting
@@ -1156,3 +1198,37 @@ Supabase free tier includes 500 MB database, 500K Edge Function invocations, and
 | "Invalid API key" from OpenRouter | Key expired or wrong | Generate a new key at openrouter.ai and update with `supabase secrets set`. |
 | "Invalid Slack signature" in function logs | Wrong signing secret, or clock skew | Verify `SLACK_SIGNING_SECRET` matches your Slack app's Basic Information page. |
 | MCP tools not showing in AI client | Client not connected, or server URL wrong | Reconnect the MCP server. For Claude Code, run `claude mcp list` to verify. |
+| Duplicate thoughts appearing | Slack retried the webhook before the function responded | The function deduplicates via `slack_ts`. Delete pre-existing duplicates in the Table Editor. |
+
+---
+
+## Appendix C: Backup and Export
+
+Supabase free tier does not include automatic backups. If your project is deleted or corrupted, captured thoughts are lost. Options for protecting your data:
+
+**Manual SQL export (free tier):**
+
+Run this in the Supabase SQL Editor to export all thoughts as JSON:
+
+```sql
+copy (
+  select json_agg(row_to_json(t))
+  from (select id, content, metadata, created_at from thoughts order by created_at) t
+) to stdout;
+```
+
+Copy the output and save it locally. Run this periodically (weekly or monthly).
+
+**Supabase CLI (if you have direct database access):**
+
+```bash
+supabase db dump --data-only -f thoughts-backup.sql
+```
+
+**Automatic daily backups:**
+
+Available on Supabase Pro plan ($25/month). Includes point-in-time recovery for 7 days.
+
+**Embedding note:** Backups include the raw `content` and `metadata` but embeddings are large (1536 floats per row).
+If you restore to a new project with the same embedding model, you can re-generate embeddings.
+If the model changes, you will need to re-embed all content.
