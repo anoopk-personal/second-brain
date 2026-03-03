@@ -26,9 +26,11 @@ second-brain/
 
 ## Workflow
 
-- PRs target `main`; `lint-check` is the required status check
+- **No direct pushes to `main`** -- all changes go through PRs
+- **Ruleset:** `main-protection` -- requires `lint-check` and `lint-and-test` status checks to pass before merge
 - `.github/workflows/auto-merge.yml` enables auto-merge with squash on every PR to `main`
 - Branches are automatically deleted after merge
+- **Branch prefixes:** `feature/`, `fix/`, `docs/`, `test/`, `chore/`
 
 ## Secrets
 
