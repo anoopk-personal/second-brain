@@ -7,6 +7,7 @@
 *.key
 *.p12
 *.pfx
+*.keystore
 credentials.json
 token.json
 **/secrets/

@@ -8,12 +8,26 @@ Documentation repo for the Second Brain system -- a personal knowledge capture a
 
 ```text
 second-brain/
+  .github/
+    workflows/
+      ci.yml                  # Markdown lint (advisory) + lint-check summary job
+      auto-merge.yml          # Squash-merge PRs to main, delete branches
+    dependabot.yml            # Weekly GitHub Actions version updates
   docs/
     second-brain-guide.md     # Step-by-step setup guide for capture and retrieval
     second-brain-prompts.md   # Companion prompts for migration, discovery, reviews
-  README.md                   # Project overview and architecture diagram
+  .gitignore                  # Security-focused patterns (secrets, credentials, OS artifacts)
+  .markdownlint.json          # Lint config (relaxed line length, allow inline HTML)
   CLAUDE.md                   # This file
   LICENSE                     # MIT
+  README.md                   # Project overview and architecture diagram
+```
+
+## Commands
+
+```bash
+# Lint all markdown files locally
+npx markdownlint '**/*.md' --ignore node_modules
 ```
 
 ## CI
@@ -27,7 +41,7 @@ second-brain/
 ## Workflow
 
 - **No direct pushes to `main`** -- all changes go through PRs
-- **Ruleset:** `main-protection` -- requires `lint-check` and `lint-and-test` status checks to pass before merge
+- **Ruleset:** `main-protection` -- requires `lint-check` status check to pass before merge
 - `.github/workflows/auto-merge.yml` enables auto-merge with squash on every PR to `main`
 - Branches are automatically deleted after merge
 - **Branch prefixes:** `feature/`, `fix/`, `docs/`, `test/`, `chore/`
