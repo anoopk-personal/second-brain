@@ -1039,6 +1039,10 @@ Deno.serve(app.fetch);
 supabase functions deploy second-brain-mcp --no-verify-jwt
 ```
 
+> **Why `--no-verify-jwt`?** MCP clients do not send Supabase JWTs. Instead, the function verifies
+> every request using the `x-brain-key` header with timing-safe comparison. This provides equivalent
+> authentication without requiring MCP clients to know about Supabase tokens.
+
 Copy the **MCP Server URL** from the output and save it.
 
 ---
