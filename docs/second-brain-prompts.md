@@ -49,7 +49,7 @@ the connected MCP tools.
 
 <execution>
 For each approved item, save it to the Second Brain using the MCP
-search_thoughts or equivalent capture tool. Format each save as a clear,
+capture_thought tool. Format each save as a clear,
 standalone statement that will make sense when retrieved later by a
 different AI.
 

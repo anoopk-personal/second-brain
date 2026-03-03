@@ -169,9 +169,10 @@ create policy "Service role full access"
 ### Step 4: Get an OpenRouter API Key
 
 1. Go to [openrouter.ai](https://openrouter.ai) and create an account.
-2. Go to **Keys > Create Key**.
-3. Name: `second-brain`.
-4. Copy the key and save it in your credential tracker.
+2. Add a few dollars in credits (pay-as-you-go). The models used here cost fractions of a cent per call -- see Appendix A for a full breakdown.
+3. Go to **Keys > Create Key**.
+4. Name: `second-brain`.
+5. Copy the key and save it in your credential tracker.
 
 ---
 
@@ -426,7 +427,7 @@ Copy the **Edge Function URL** from the output and save it in your credential tr
 
 1. Go to your Slack capture channel.
 2. Type a message:
-   ```
+   ```text
    Testing my second brain. This is my first captured thought.
    ```
 3. Wait a few seconds.
@@ -490,24 +491,26 @@ Create `supabase/functions/second-brain-mcp/deno.json`:
 Replace `supabase/functions/second-brain-mcp/index.ts` with the following. This implements four MCP tools: `search_thoughts`, `list_thoughts`, `thought_stats`, and `capture_thought`.
 
 ```typescript
-import { createClient } from "@supabase/supabase-js";
+import "jsr:@supabase/functions-js/edge-runtime.d.ts";
+
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { StreamableHTTPTransport } from "@hono/mcp";
+import { Hono } from "hono";
 import { z } from "zod";
+import { createClient } from "@supabase/supabase-js";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 const OPENROUTER_API_KEY = Deno.env.get("OPENROUTER_API_KEY")!;
 const MCP_ACCESS_KEY = Deno.env.get("MCP_ACCESS_KEY")!;
 
-const OPENROUTER_BASE = "https://openrouter.ai/api/v1";
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
 async function getEmbedding(text: string): Promise<number[]> {
-  const response = await fetch(`${OPENROUTER_BASE}/embeddings`, {
+  const r = await fetch("https://openrouter.ai/api/v1/embeddings", {
     method: "POST",
     headers: {
-      "Authorization": `Bearer ${OPENROUTER_API_KEY}`,
+      Authorization: `Bearer ${OPENROUTER_API_KEY}`,
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
@@ -515,178 +518,337 @@ async function getEmbedding(text: string): Promise<number[]> {
       input: text,
     }),
   });
-  const data = await response.json();
-  return data.data[0].embedding;
+  const d = await r.json();
+  return d.data[0].embedding;
 }
 
-function createServer(): McpServer {
-  const server = new McpServer({
-    name: "second-brain",
-    version: "1.0.0",
-  });
+// --- MCP Server Setup ---
 
-  server.tool(
-    "search_thoughts",
-    "Search captured thoughts by meaning",
-    {
+const server = new McpServer({
+  name: "second-brain",
+  version: "1.0.0",
+});
+
+// Tool 1: Semantic Search
+server.registerTool(
+  "search_thoughts",
+  {
+    title: "Search Thoughts",
+    description:
+      "Search captured thoughts by meaning. Use this when the user asks about a topic, person, or idea they've previously captured.",
+    inputSchema: {
       query: z.string().describe("What to search for"),
-      limit: z.number().default(10).describe("Maximum results to return"),
-      threshold: z.number().default(0.5).describe("Minimum similarity (0-1)"),
+      limit: z.number().optional().default(10),
+      threshold: z.number().optional().default(0.5),
     },
-    async ({ query, limit, threshold }) => {
-      const embedding = await getEmbedding(query);
+  },
+  async ({ query, limit, threshold }) => {
+    try {
+      const qEmb = await getEmbedding(query);
       const { data, error } = await supabase.rpc("match_thoughts", {
-        query_embedding: embedding,
+        query_embedding: qEmb,
         match_threshold: threshold,
         match_count: limit,
+        filter: {},
       });
-      if (error) {
-        return { content: [{ type: "text" as const, text: `Error: ${error.message}` }] };
-      }
-      const results = (data || []).map((t: Record<string, unknown>) => ({
-        content: t.content,
-        similarity: t.similarity,
-        metadata: t.metadata,
-        created_at: t.created_at,
-      }));
-      return { content: [{ type: "text" as const, text: JSON.stringify(results, null, 2) }] };
-    },
-  );
 
-  server.tool(
-    "list_thoughts",
-    "List recently captured thoughts with optional filters",
-    {
-      type: z
-        .enum(["observation", "task", "idea", "reference", "person_note"])
-        .optional()
-        .describe("Filter by thought type"),
+      if (error) {
+        return {
+          content: [{ type: "text" as const, text: `Search error: ${error.message}` }],
+          isError: true,
+        };
+      }
+
+      if (!data || data.length === 0) {
+        return {
+          content: [{ type: "text" as const, text: `No thoughts found matching "${query}".` }],
+        };
+      }
+
+      const results = data.map(
+        (
+          t: {
+            content: string;
+            metadata: Record<string, unknown>;
+            similarity: number;
+            created_at: string;
+          },
+          i: number
+        ) => {
+          const m = t.metadata || {};
+          const parts = [
+            `--- Result ${i + 1} (${(t.similarity * 100).toFixed(1)}% match) ---`,
+            `Captured: ${new Date(t.created_at).toLocaleDateString()}`,
+            `Type: ${m.type || "unknown"}`,
+          ];
+          if (Array.isArray(m.topics) && m.topics.length)
+            parts.push(`Topics: ${(m.topics as string[]).join(", ")}`);
+          if (Array.isArray(m.people) && m.people.length)
+            parts.push(`People: ${(m.people as string[]).join(", ")}`);
+          if (Array.isArray(m.action_items) && m.action_items.length)
+            parts.push(`Actions: ${(m.action_items as string[]).join("; ")}`);
+          parts.push(`\n${t.content}`);
+          return parts.join("\n");
+        }
+      );
+
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `Found ${data.length} thought(s):\n\n${results.join("\n\n")}`,
+          },
+        ],
+      };
+    } catch (err: unknown) {
+      return {
+        content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
+// Tool 2: List Recent
+server.registerTool(
+  "list_thoughts",
+  {
+    title: "List Recent Thoughts",
+    description:
+      "List recently captured thoughts with optional filters by type, topic, person, or time range.",
+    inputSchema: {
+      limit: z.number().optional().default(10),
+      type: z.string().optional().describe("Filter by type: observation, task, idea, reference, person_note"),
       topic: z.string().optional().describe("Filter by topic tag"),
       person: z.string().optional().describe("Filter by person mentioned"),
       days: z.number().optional().describe("Only thoughts from the last N days"),
-      limit: z.number().default(10).describe("Maximum results to return"),
     },
-    async ({ type, topic, person, days, limit }) => {
-      let query = supabase
+  },
+  async ({ limit, type, topic, person, days }) => {
+    try {
+      let q = supabase
         .from("thoughts")
-        .select("id, content, metadata, created_at")
+        .select("content, metadata, created_at")
         .order("created_at", { ascending: false })
         .limit(limit);
+
+      if (type) q = q.contains("metadata", { type });
+      if (topic) q = q.contains("metadata", { topics: [topic] });
+      if (person) q = q.contains("metadata", { people: [person] });
       if (days) {
         const since = new Date();
         since.setDate(since.getDate() - days);
-        query = query.gte("created_at", since.toISOString());
+        q = q.gte("created_at", since.toISOString());
       }
-      if (type) query = query.contains("metadata", { type });
-      if (topic) query = query.contains("metadata", { topics: [topic] });
-      if (person) query = query.contains("metadata", { people: [person] });
-      const { data, error } = await query;
-      if (error) {
-        return { content: [{ type: "text" as const, text: `Error: ${error.message}` }] };
-      }
-      return { content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }] };
-    },
-  );
 
-  server.tool(
-    "thought_stats",
-    "Get a summary of all captured thoughts: totals, types, top topics, and people",
-    {},
-    async () => {
-      const { data, error } = await supabase
-        .from("thoughts")
-        .select("metadata, created_at");
+      const { data, error } = await q;
+
       if (error) {
-        return { content: [{ type: "text" as const, text: `Error: ${error.message}` }] };
+        return {
+          content: [{ type: "text" as const, text: `Error: ${error.message}` }],
+          isError: true,
+        };
       }
+
+      if (!data || !data.length) {
+        return { content: [{ type: "text" as const, text: "No thoughts found." }] };
+      }
+
+      const results = data.map(
+        (
+          t: { content: string; metadata: Record<string, unknown>; created_at: string },
+          i: number
+        ) => {
+          const m = t.metadata || {};
+          const tags = Array.isArray(m.topics) ? (m.topics as string[]).join(", ") : "";
+          return `${i + 1}. [${new Date(t.created_at).toLocaleDateString()}] (${m.type || "??"}${tags ? " - " + tags : ""})\n   ${t.content}`;
+        }
+      );
+
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `${data.length} recent thought(s):\n\n${results.join("\n\n")}`,
+          },
+        ],
+      };
+    } catch (err: unknown) {
+      return {
+        content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
+// Tool 3: Stats
+server.registerTool(
+  "thought_stats",
+  {
+    title: "Thought Statistics",
+    description: "Get a summary of all captured thoughts: totals, types, top topics, and people.",
+    inputSchema: {},
+  },
+  async () => {
+    try {
+      const { count } = await supabase
+        .from("thoughts")
+        .select("*", { count: "exact", head: true });
+
+      const { data } = await supabase
+        .from("thoughts")
+        .select("metadata, created_at")
+        .order("created_at", { ascending: false });
+
       const types: Record<string, number> = {};
       const topics: Record<string, number> = {};
       const people: Record<string, number> = {};
-      for (const row of data || []) {
-        const m = (row.metadata || {}) as Record<string, unknown>;
-        const typeName = (m.type as string) || "unknown";
-        types[typeName] = (types[typeName] || 0) + 1;
-        for (const t of (m.topics as string[]) || []) {
-          topics[t] = (topics[t] || 0) + 1;
-        }
-        for (const p of (m.people as string[]) || []) {
-          people[p] = (people[p] || 0) + 1;
-        }
-      }
-      const sorted = (obj: Record<string, number>) =>
-        Object.fromEntries(Object.entries(obj).sort((a, b) => b[1] - a[1]));
-      return {
-        content: [{
-          type: "text" as const,
-          text: JSON.stringify({
-            total: (data || []).length,
-            types: sorted(types),
-            top_topics: Object.fromEntries(
-              Object.entries(sorted(topics)).slice(0, 10),
-            ),
-            top_people: Object.fromEntries(
-              Object.entries(sorted(people)).slice(0, 10),
-            ),
-          }, null, 2),
-        }],
-      };
-    },
-  );
 
-  server.tool(
-    "capture_thought",
-    "Save a new thought to the second brain",
-    {
+      for (const r of data || []) {
+        const m = (r.metadata || {}) as Record<string, unknown>;
+        if (m.type) types[m.type as string] = (types[m.type as string] || 0) + 1;
+        if (Array.isArray(m.topics))
+          for (const t of m.topics) topics[t as string] = (topics[t as string] || 0) + 1;
+        if (Array.isArray(m.people))
+          for (const p of m.people) people[p as string] = (people[p as string] || 0) + 1;
+      }
+
+      const sort = (o: Record<string, number>): [string, number][] =>
+        Object.entries(o)
+          .sort((a, b) => b[1] - a[1])
+          .slice(0, 10);
+
+      const lines: string[] = [
+        `Total thoughts: ${count}`,
+        `Date range: ${
+          data?.length
+            ? new Date(data[data.length - 1].created_at).toLocaleDateString() +
+              " → " +
+              new Date(data[0].created_at).toLocaleDateString()
+            : "N/A"
+        }`,
+        "",
+        "Types:",
+        ...sort(types).map(([k, v]) => `  ${k}: ${v}`),
+      ];
+
+      if (Object.keys(topics).length) {
+        lines.push("", "Top topics:");
+        for (const [k, v] of sort(topics)) lines.push(`  ${k}: ${v}`);
+      }
+
+      if (Object.keys(people).length) {
+        lines.push("", "People mentioned:");
+        for (const [k, v] of sort(people)) lines.push(`  ${k}: ${v}`);
+      }
+
+      return { content: [{ type: "text" as const, text: lines.join("\n") }] };
+    } catch (err: unknown) {
+      return {
+        content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
+// Tool 4: Capture Thought
+server.registerTool(
+  "capture_thought",
+  {
+    title: "Capture Thought",
+    description:
+      "Save a new thought to the second brain. Use this to capture observations, tasks, ideas, references, or notes about people.",
+    inputSchema: {
       content: z.string().describe("The thought content to save"),
       type: z
         .enum(["observation", "task", "idea", "reference", "person_note"])
         .describe("Type of thought"),
-      topics: z.array(z.string()).default([]).describe("Topic tags"),
-      people: z.array(z.string()).default([]).describe("People mentioned"),
+      topics: z
+        .array(z.string())
+        .optional()
+        .default([])
+        .describe("Topic tags for categorization"),
+      people: z
+        .array(z.string())
+        .optional()
+        .default([])
+        .describe("People mentioned in this thought"),
       action_items: z
         .array(z.string())
+        .optional()
         .default([])
         .describe("Action items extracted from this thought"),
     },
-    async ({ content, type, topics, people, action_items }) => {
+  },
+  async ({ content, type, topics, people, action_items }) => {
+    try {
       const embedding = await getEmbedding(content);
+
+      const metadata = {
+        type,
+        topics,
+        people,
+        action_items,
+        source: "mcp",
+      };
+
       const { error } = await supabase.from("thoughts").insert({
         content,
         embedding,
-        metadata: { type, topics, people, action_items, source: "mcp" },
+        metadata,
       });
+
       if (error) {
-        return { content: [{ type: "text" as const, text: `Error: ${error.message}` }] };
+        return {
+          content: [
+            { type: "text" as const, text: `Failed to save thought: ${error.message}` },
+          ],
+          isError: true,
+        };
       }
-      const label = [type, ...topics].join(", ");
+
+      const preview = content.length > 100 ? content.slice(0, 100) + "..." : content;
       return {
-        content: [{ type: "text" as const, text: `Captured: ${label}` }],
+        content: [
+          {
+            type: "text" as const,
+            text: `Thought saved successfully.\nType: ${type}\nTopics: ${topics.length ? topics.join(", ") : "none"}\nContent: ${preview}`,
+          },
+        ],
       };
-    },
-  );
+    } catch (err: unknown) {
+      return {
+        content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }],
+        isError: true,
+      };
+    }
+  }
+);
 
-  return server;
-}
+// --- Hono App with Auth Check ---
 
-// HTTP handler with auth
-Deno.serve(async (req: Request): Promise<Response> => {
-  const url = new URL(req.url);
-  const key = req.headers.get("x-brain-key") || url.searchParams.get("key");
-  if (key !== MCP_ACCESS_KEY) {
-    return new Response(JSON.stringify({ error: "Unauthorized" }), {
-      status: 401,
-      headers: { "Content-Type": "application/json" },
-    });
+const app = new Hono();
+
+app.all("*", async (c) => {
+  // MCP uses POST exclusively
+  if (c.req.method !== "POST") {
+    return c.json({ error: "Method not allowed" }, 405);
   }
 
-  const server = createServer();
-  const transport = new StreamableHTTPServerTransport({
-    sessionIdGenerator: undefined,
-  });
-  await server.connect(transport);
+  // Check access key (header preferred, query param as fallback for clients that embed it in the URL)
+  const provided = c.req.header("x-brain-key") || new URL(c.req.url).searchParams.get("key");
+  if (!provided || provided !== MCP_ACCESS_KEY) {
+    return c.json({ error: "Invalid or missing access key" }, 401);
+  }
 
-  return transport.handleRequest(req);
+  const transport = new StreamableHTTPTransport();
+  await server.connect(transport);
+  return transport.handleRequest(c);
 });
+
+Deno.serve(app.fetch);
 ```
 
 #### Deploy
@@ -760,6 +922,14 @@ Add this to your MCP client configuration (typically `~/.cursor/mcp.json`, `sett
   }
 }
 ```
+
+#### Securing your access key
+
+The examples above embed the key directly in URLs and config files for simplicity. For ongoing use, store it in an environment variable instead:
+
+- **direnv:** Add `export BRAIN_KEY=your-access-key` to `~/.envrc` and reference `${BRAIN_KEY}` in your configs.
+- **Shell profile:** Add the export to `~/.zshrc` or `~/.bashrc`.
+- **macOS Keychain / 1Password CLI:** Retrieve the key at runtime rather than storing it in plaintext files.
 
 ---
 
