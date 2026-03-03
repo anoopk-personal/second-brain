@@ -10,7 +10,7 @@ A step-by-step guide to building a personal knowledge capture and retrieval syst
 
 Print or copy this credential tracker. Fill in each value as you complete the corresponding step.
 
-```
+```text
 SECOND BRAIN -- CREDENTIAL TRACKER
 Keep this file. Fill in as you go.
 --------------------------------------
@@ -211,7 +211,7 @@ create policy "Service role full access"
 
 In Slack, go to your capture channel and type:
 
-```
+```text
 /invite @Second Brain
 ```
 
@@ -699,7 +699,7 @@ Copy the **MCP Server URL** from the output and save it.
 
 Your **MCP Connection URL** is the server URL with your access key appended:
 
-```
+```text
 https://YOUR_PROJECT_REF.supabase.co/functions/v1/second-brain-mcp?key=YOUR_MCP_ACCESS_KEY
 ```
 
