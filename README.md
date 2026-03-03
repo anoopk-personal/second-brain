@@ -4,7 +4,7 @@ A personal knowledge system that captures thoughts from Slack, stores them with 
 
 ## Architecture
 
-```
+```text
 Slack message
     |
     v

@@ -23,7 +23,7 @@ jobs:
           node-version: '20'
 
       - name: Install markdownlint-cli
-        run: npm install -g markdownlint-cli
+        run: npm install -g markdownlint-cli@0.44.0
 
       - name: Lint markdown files
         run: |
@@ -42,8 +42,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check lint results
+        env:
+          LINT_RESULT: ${{ needs.markdown-lint.result }}
         run: |
-          if [ "${{ needs.markdown-lint.result }}" = "success" ]; then
+          if [ "$LINT_RESULT" = "success" ]; then
             echo "All checks passed"
             exit 0
           fi

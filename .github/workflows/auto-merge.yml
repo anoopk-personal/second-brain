@@ -19,10 +19,12 @@ jobs:
       - name: Enable auto-merge
         env:
           GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
         run: |
-          echo "Enabling auto-merge for PR #${{ github.event.pull_request.number }}"
-          gh pr merge ${{ github.event.pull_request.number }} \
-            --repo ${{ github.repository }} \
+          echo "Enabling auto-merge for PR #${PR_NUMBER}"
+          gh pr merge "${PR_NUMBER}" \
+            --repo "${REPO}" \
             --auto \
             --squash \
             --delete-branch
