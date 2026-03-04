@@ -18,6 +18,19 @@ Total setup time: 30-60 minutes. Ongoing cost: under $0.30/month for typical use
 
 ---
 
+## Privacy
+
+All captured thoughts are sent to external APIs for processing:
+
+- **Embeddings** are generated via OpenRouter using OpenAI's `text-embedding-3-small` model.
+- **Metadata extraction** uses OpenAI's `gpt-4o-mini` via OpenRouter.
+
+Your thought content transits OpenRouter and OpenAI servers. Do not capture information you would not send to a third-party API.
+Review [OpenRouter's privacy policy](https://openrouter.ai/privacy) and
+[OpenAI's API data usage policy](https://openai.com/enterprise-privacy/) before use.
+
+---
+
 ## Prerequisites
 
 - **Supabase account** -- [supabase.com](https://supabase.com) (free tier works)
@@ -29,6 +42,20 @@ Total setup time: 30-60 minutes. Ongoing cost: under $0.30/month for typical use
 - **openssl** -- pre-installed on macOS and most Linux distros (used to generate the MCP access key)
 
 > **Tested with:** Supabase CLI 2.x, Deno 1.x, Node.js 20, @supabase/supabase-js 2.47.10, @modelcontextprotocol/sdk 1.24.3, hono 4.9.2, zod 4.1.13
+
+### Supabase Free Tier Limits
+
+The free tier is sufficient for personal use, but be aware of the limits:
+
+| Resource | Free tier limit |
+|---|---|
+| Database storage | 500 MB |
+| Edge Function invocations | 500,000 / month |
+| Bandwidth | 2 GB / month |
+| Edge Function execution time | 60 seconds per invocation |
+| Automatic backups | Not included (see [Appendix C](#appendix-c-backup-and-export)) |
+
+At 20 thoughts/day (~600 invocations/month for capture + retrieval), you will use a small fraction of these limits. Storage becomes relevant at 50,000+ thoughts.
 
 ---
 
@@ -168,6 +195,19 @@ $$;
 ```
 
 > **Already set up?** If you created the function without the `least()` cap, run the `CREATE OR REPLACE FUNCTION` block above again in the SQL Editor. It will update the existing function in place.
+
+#### Add deduplication column
+
+Slack retries webhook deliveries if the function does not respond within 3 seconds. The `slack_ts` column with a unique index prevents duplicate thoughts from concurrent retries.
+
+```sql
+alter table thoughts add column slack_ts text;
+
+create unique index on thoughts (slack_ts) where slack_ts is not null;
+```
+
+> **Already have thoughts in the table?** If you added the `slack_ts` column after capturing thoughts, backfill it
+> from metadata: `update thoughts set slack_ts = metadata->>'slack_ts' where metadata->>'slack_ts' is not null;`
 
 #### Enable row-level security
 
@@ -318,8 +358,17 @@ const SLACK_SIGNING_SECRET = Deno.env.get("SLACK_SIGNING_SECRET")!.trim();
 const OPENROUTER_BASE = "https://openrouter.ai/api/v1";
 const MAX_INPUT_LENGTH = 10_000;
 const SLACK_TIMESTAMP_MAX_AGE_SECONDS = 300; // 5 minutes
+const FETCH_TIMEOUT_MS = 10_000;
+const MAX_ERROR_LOG_LENGTH = 500;
+
+const EMBEDDING_MODEL = Deno.env.get("EMBEDDING_MODEL")?.trim() || "openai/text-embedding-3-small";
+const METADATA_MODEL = Deno.env.get("METADATA_MODEL")?.trim() || "openai/gpt-4o-mini";
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+
+function sanitizeErrorDetail(raw: string): string {
+  return raw.slice(0, MAX_ERROR_LOG_LENGTH);
+}
 
 // --- Slack signature verification ---
 
@@ -377,12 +426,13 @@ async function getEmbedding(text: string): Promise<number[]> {
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
-      model: "openai/text-embedding-3-small",
+      model: EMBEDDING_MODEL,
       input: text,
     }),
+    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
   });
   if (!r.ok) {
-    const detail = await r.text();
+    const detail = sanitizeErrorDetail(await r.text());
     throw new Error(`Embedding API error (${r.status}): ${detail}`);
   }
   const d = await r.json();
@@ -403,7 +453,7 @@ async function extractMetadata(
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
-      model: "openai/gpt-4o-mini",
+      model: METADATA_MODEL,
       response_format: { type: "json_object" },
       messages: [
         {
@@ -419,9 +469,10 @@ Only extract what's explicitly there.`,
         { role: "user", content: `Thought: ${serializedInput}` },
       ],
     }),
+    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
   });
   if (!r.ok) {
-    const detail = await r.text();
+    const detail = sanitizeErrorDetail(await r.text());
     throw new Error(`Metadata API error (${r.status}): ${detail}`);
   }
   const d = await r.json();
@@ -444,9 +495,11 @@ async function replyInSlack(
       "Content-Type": "application/json",
     },
     body: JSON.stringify({ channel, thread_ts: threadTs, text }),
+    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
   });
   if (!r.ok) {
-    console.error(`Slack reply failed (${r.status}): ${await r.text()}`);
+    const detail = sanitizeErrorDetail(await r.text());
+    console.error(`Slack reply failed (${r.status}): ${detail}`);
   }
 }
 
@@ -505,7 +558,7 @@ Deno.serve(async (req: Request): Promise<Response> => {
     const { data: existing } = await supabase
       .from("thoughts")
       .select("id")
-      .contains("metadata", { slack_ts: messageTs })
+      .eq("slack_ts", messageTs)
       .limit(1);
 
     if (existing && existing.length > 0) {
@@ -518,14 +571,19 @@ Deno.serve(async (req: Request): Promise<Response> => {
       extractMetadata(messageText),
     ]);
 
-    // Store the thought
+    // Store the thought (unique constraint on slack_ts prevents race-condition duplicates)
     const { error } = await supabase.from("thoughts").insert({
       content: messageText,
       embedding,
-      metadata: { ...metadata, source: "slack", slack_ts: messageTs, embedding_model: "text-embedding-3-small" },
+      slack_ts: messageTs,
+      metadata: { ...metadata, source: "slack", slack_ts: messageTs, embedding_model: EMBEDDING_MODEL },
     });
 
     if (error) {
+      // Unique constraint on slack_ts means a concurrent retry already inserted this thought
+      if (error.code === "23505") {
+        return new Response("ok", { status: 200 });
+      }
       console.error("Supabase insert error:", error);
       await replyInSlack(
         channel,
@@ -694,7 +752,16 @@ const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!.tri
 const OPENROUTER_API_KEY = Deno.env.get("OPENROUTER_API_KEY")!.trim();
 const MCP_ACCESS_KEY = Deno.env.get("MCP_ACCESS_KEY")!.trim();
 
+const FETCH_TIMEOUT_MS = 10_000;
+const MAX_ERROR_LOG_LENGTH = 500;
+
+const EMBEDDING_MODEL = Deno.env.get("EMBEDDING_MODEL")?.trim() || "openai/text-embedding-3-small";
+
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+
+function sanitizeErrorDetail(raw: string): string {
+  return raw.slice(0, MAX_ERROR_LOG_LENGTH);
+}
 
 // --- Timing-safe comparison ---
 
@@ -719,12 +786,13 @@ async function getEmbedding(text: string): Promise<number[]> {
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
-      model: "openai/text-embedding-3-small",
+      model: EMBEDDING_MODEL,
       input: text,
     }),
+    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
   });
   if (!r.ok) {
-    const detail = await r.text();
+    const detail = sanitizeErrorDetail(await r.text());
     throw new Error(`Embedding API error (${r.status}): ${detail}`);
   }
   const d = await r.json();
@@ -1008,7 +1076,7 @@ server.registerTool(
         people,
         action_items,
         source: "mcp",
-        embedding_model: "text-embedding-3-small",
+        embedding_model: EMBEDDING_MODEL,
       };
 
       const { error } = await supabase.from("thoughts").insert({
@@ -1230,10 +1298,10 @@ All pricing is based on OpenRouter's pass-through rates for the models used.
 
 Supabase free tier includes 500 MB database, 500K Edge Function invocations, and 2 GB bandwidth per month. This is more than sufficient for personal use.
 
-> **Model dependency:** Both edge functions use `openai/text-embedding-3-small` (1536 dimensions) for embeddings
-> and `openai/gpt-4o-mini` for metadata extraction, routed through OpenRouter. If these models become unavailable
-> or change on OpenRouter, update the model names in both edge functions and redeploy. Changing the embedding model
-> requires re-embedding all existing thoughts (see Appendix C).
+> **Model dependency:** Both edge functions default to `openai/text-embedding-3-small` (1536 dimensions) for embeddings
+> and `openai/gpt-4o-mini` for metadata extraction, routed through OpenRouter. To swap models without code changes,
+> set the `EMBEDDING_MODEL` and/or `METADATA_MODEL` environment variables via `supabase secrets set` and redeploy.
+> Changing the embedding model requires re-embedding all existing thoughts (see Appendix C).
 
 ---
 
@@ -1250,7 +1318,7 @@ Supabase free tier includes 500 MB database, 500K Edge Function invocations, and
 | "Invalid API key" from OpenRouter | Key expired or wrong | Generate a new key at openrouter.ai and update with `supabase secrets set`. |
 | "Invalid Slack signature" in function logs | Wrong signing secret, or clock skew | Verify `SLACK_SIGNING_SECRET` matches your Slack app's Basic Information page. |
 | MCP tools not showing in AI client | Client not connected, or server URL wrong | Reconnect the MCP server. For Claude Code, run `claude mcp list` to verify. |
-| Duplicate thoughts appearing | Slack retried the webhook before the function responded | The function deduplicates via `slack_ts`. Delete pre-existing duplicates in the Table Editor. |
+| Duplicate thoughts appearing | Slack retried the webhook before the function responded | The `slack_ts` unique index prevents duplicates. Delete pre-existing duplicates in the Table Editor. |
 
 ---
 
@@ -1354,3 +1422,64 @@ If any secret is compromised or you need to rotate keys periodically, follow the
    ```
 
 6. Verify: send a test thought in Slack and confirm the bot replies.
+
+---
+
+## Appendix E: Data Management
+
+The primary interface for managing thoughts is through MCP tools and AI clients. For operations not exposed through MCP (deletion, editing, bulk export), use the Supabase SQL Editor or any Postgres client.
+
+### Delete a thought
+
+```sql
+-- Find the thought first
+select id, content, created_at from thoughts
+where content ilike '%search term%'
+order by created_at desc
+limit 5;
+
+-- Delete by ID
+delete from thoughts where id = 'uuid-here';
+```
+
+### Edit a thought
+
+```sql
+update thoughts
+set content = 'corrected content here'
+where id = 'uuid-here';
+```
+
+> **Note:** Editing content does not update the embedding or metadata. If the meaning changed significantly, delete the thought and re-capture it so the embedding and metadata reflect the new content.
+
+### Export all thoughts as JSON
+
+```sql
+select json_agg(
+  json_build_object(
+    'id', id,
+    'content', content,
+    'metadata', metadata,
+    'created_at', created_at
+  ) order by created_at
+)
+from thoughts;
+```
+
+### Export as CSV
+
+```sql
+copy (
+  select id, content, metadata->>'type' as type,
+         metadata->>'topics' as topics,
+         metadata->>'people' as people,
+         created_at
+  from thoughts order by created_at
+) to stdout with csv header;
+```
+
+### Delete all thoughts (reset)
+
+```sql
+truncate thoughts;
+```

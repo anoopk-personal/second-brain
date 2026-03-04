@@ -19,8 +19,10 @@ second-brain/
   .gitignore                  # Security-focused patterns (secrets, credentials, OS artifacts)
   .markdownlint.json          # Lint config (relaxed line length, allow inline HTML)
   CLAUDE.md                   # This file
+  CONTRIBUTING.md             # Contribution guidelines (minimal, personal project)
   LICENSE                     # MIT
-  README.md                   # Project overview and architecture diagram
+  README.md                   # Project overview, privacy notice, FAQ
+  SECURITY.md                 # Vulnerability reporting process
 ```
 
 ## Commands
