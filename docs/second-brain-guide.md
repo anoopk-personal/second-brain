@@ -626,6 +626,11 @@ supabase secrets set SLACK_CAPTURE_CHANNEL=C0your-channel-id-here
 supabase secrets set SLACK_SIGNING_SECRET=your-signing-secret-here
 ```
 
+> **Optional model overrides:** The function defaults to `openai/text-embedding-3-small` for
+> embeddings and `openai/gpt-4o-mini` for metadata extraction. To use different models, set
+> `EMBEDDING_MODEL` and/or `METADATA_MODEL` via `supabase secrets set`. Changing the embedding
+> model requires re-embedding all existing thoughts (see Appendix C).
+
 #### Deploy
 
 ```bash
@@ -692,6 +697,10 @@ Set it as a Supabase secret:
 ```bash
 supabase secrets set MCP_ACCESS_KEY=your-generated-key-here
 ```
+
+> **Optional model override:** The MCP server defaults to `openai/text-embedding-3-small` for
+> search embeddings. To use a different model, set `EMBEDDING_MODEL` via `supabase secrets set`.
+> This must match the model used by `ingest-thought` or search similarity will degrade.
 
 ---
 

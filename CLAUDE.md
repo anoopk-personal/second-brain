@@ -29,7 +29,7 @@ second-brain/
 
 ```bash
 # Lint all markdown files locally
-npx markdownlint '**/*.md' --ignore node_modules
+bun x markdownlint-cli '**/*.md' --ignore node_modules
 ```
 
 ## CI
