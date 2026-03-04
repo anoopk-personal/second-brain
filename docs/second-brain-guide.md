@@ -28,6 +28,8 @@ Total setup time: 30-60 minutes. Ongoing cost: under $0.30/month for typical use
 - **Terminal access** -- all deployment commands run from the terminal
 - **openssl** -- pre-installed on macOS and most Linux distros (used to generate the MCP access key)
 
+> **Tested with:** Supabase CLI 2.x, Deno 1.x, Node.js 20, @supabase/supabase-js 2.47.10, @modelcontextprotocol/sdk 1.24.3, hono 4.9.2, zod 4.1.13
+
 ---
 
 ## Before You Start
@@ -59,7 +61,7 @@ SLACK
   Channel name:         ________________
   Channel ID:           ________________  <- Step 5
   Bot OAuth Token:      ________________  <- Step 6
-  Signing Secret:       ________________  <- Step 6.5
+  Signing Secret:       ________________  <- Step 6
 
 GENERATED DURING SETUP
   Edge Function URL:    ________________  <- Step 7
@@ -135,7 +137,7 @@ create trigger thoughts_updated_at
 ```sql
 create or replace function match_thoughts(
   query_embedding vector(1536),
-  match_threshold float default 0.7,
+  match_threshold float default 0.5,
   match_count int default 10,
   filter jsonb default '{}'::jsonb
 )
@@ -242,9 +244,7 @@ In Slack, go to your capture channel and type:
 /invite @Second Brain
 ```
 
----
-
-### Step 6.5: Get Your Slack Signing Secret
+#### Get your Signing Secret
 
 The ingest function verifies that every request actually comes from Slack using the app's **Signing Secret** (HMAC-SHA256 signature on every request body).
 
@@ -522,7 +522,7 @@ Deno.serve(async (req: Request): Promise<Response> => {
     const { error } = await supabase.from("thoughts").insert({
       content: messageText,
       embedding,
-      metadata: { ...metadata, source: "slack", slack_ts: messageTs },
+      metadata: { ...metadata, source: "slack", slack_ts: messageTs, embedding_model: "text-embedding-3-small" },
     });
 
     if (error) {
@@ -556,6 +556,8 @@ Deno.serve(async (req: Request): Promise<Response> => {
   }
 });
 ```
+
+> **Input length:** Messages longer than 10,000 characters are silently truncated. Only the first 10,000 characters will be captured and embedded.
 
 #### Set secrets
 
@@ -598,9 +600,11 @@ Copy the **Edge Function URL** from the output and save it in your credential tr
 
 1. Go to your Slack capture channel.
 2. Type a message:
+
    ```text
    Testing my second brain. This is my first captured thought.
    ```
+
 3. Wait a few seconds.
 4. The bot should reply in a thread with a confirmation showing the thought type and topics.
 5. Open the Supabase dashboard and check the **Table Editor > thoughts** table to see the stored record.
@@ -695,12 +699,14 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 // --- Timing-safe comparison ---
 
 function timingSafeEqual(a: string, b: string): boolean {
-  if (a.length !== b.length) return false;
+  const maxLen = Math.max(a.length, b.length);
+  const paddedA = a.padEnd(maxLen, "\0");
+  const paddedB = b.padEnd(maxLen, "\0");
   let mismatch = 0;
-  for (let i = 0; i < a.length; i++) {
-    mismatch |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  for (let i = 0; i < maxLen; i++) {
+    mismatch |= paddedA.charCodeAt(i) ^ paddedB.charCodeAt(i);
   }
-  return mismatch === 0;
+  return mismatch === 0 && a.length === b.length;
 }
 
 // --- API helpers ---
@@ -1002,6 +1008,7 @@ server.registerTool(
         people,
         action_items,
         source: "mcp",
+        embedding_model: "text-embedding-3-small",
       };
 
       const { error } = await supabase.from("thoughts").insert({
@@ -1149,7 +1156,37 @@ Set `BRAIN_KEY` in your environment (see "Securing your access key" above) so `m
 
 ---
 
-### Step 13: Usage Examples
+### Step 13: Test Retrieval
+
+Open your MCP-connected AI client (Claude Code, Claude Desktop, etc.) and verify retrieval works:
+
+```text
+search my second brain for [topic from your test thought in Step 9]
+```
+
+You should see your test thought from Step 9 in the results. Example output:
+
+```text
+Found 1 thought(s):
+
+--- Result 1 (82.3% match) ---
+Captured: 3/1/2026
+Type: observation
+Topics: testing, second brain
+
+Testing my second brain. This is my first captured thought.
+```
+
+**If nothing is returned:**
+
+- Check MCP server logs: `supabase functions logs second-brain-mcp`
+- Verify the `BRAIN_KEY` env var is set in your shell (or equivalent in your client config)
+- Verify the `x-brain-key` header value matches `MCP_ACCESS_KEY` in Supabase secrets
+- For Claude Code, run `claude mcp list` to confirm the server is connected
+
+---
+
+### Step 14: Usage Examples
 
 Once connected, you can use natural language with any AI client. The client will call the appropriate MCP tool automatically.
 
@@ -1161,6 +1198,21 @@ Once connected, you can use natural language with any AI client. The client will
 | Filter by topic | "Show my thoughts tagged with hiring" | `list_thoughts` |
 | Check your stats | "How many thoughts are in my second brain?" | `thought_stats` |
 | Save from a conversation | "Save this to my second brain: we decided to use Postgres for the new service" | `capture_thought` |
+
+#### Example: list_thoughts output
+
+```text
+3 recent thought(s):
+
+1. [3/3/2026] (idea - architecture, microservices)
+   We should split the payment service into its own deployment unit
+
+2. [3/2/2026] (observation - hiring)
+   Sarah mentioned the backend team needs two more seniors by Q3
+
+3. [3/1/2026] (task - infrastructure)
+   Migrate the staging database to the new Supabase project by end of week
+```
 
 ---
 
@@ -1232,3 +1284,73 @@ Available on Supabase Pro plan ($25/month). Includes point-in-time recovery for 
 **Embedding note:** Backups include the raw `content` and `metadata` but embeddings are large (1536 floats per row).
 If you restore to a new project with the same embedding model, you can re-generate embeddings.
 If the model changes, you will need to re-embed all content.
+
+---
+
+## Appendix D: Key Rotation
+
+If any secret is compromised or you need to rotate keys periodically, follow the steps below.
+
+### Rotate MCP_ACCESS_KEY
+
+1. Generate a new key:
+
+   ```bash
+   openssl rand -hex 32
+   ```
+
+2. Update the Supabase secret:
+
+   ```bash
+   supabase secrets set MCP_ACCESS_KEY=your-new-key-here
+   ```
+
+3. Redeploy the MCP server:
+
+   ```bash
+   supabase functions deploy second-brain-mcp --no-verify-jwt
+   ```
+
+4. Update every client config that references the old key:
+   - **Claude Code:** `claude mcp remove second-brain` then re-add with the new key
+   - **Claude Desktop:** Settings > Connectors > Second Brain > update the `x-brain-key` header
+   - **mcp-remote clients:** Update the `BRAIN_KEY` env var or config file
+5. Verify: run a test search from your AI client to confirm the new key works.
+
+### Rotate OPENROUTER_API_KEY
+
+1. Go to [openrouter.ai/keys](https://openrouter.ai/keys) and create a new key.
+2. Update the Supabase secret:
+
+   ```bash
+   supabase secrets set OPENROUTER_API_KEY=your-new-key-here
+   ```
+
+3. Redeploy both edge functions:
+
+   ```bash
+   supabase functions deploy ingest-thought --no-verify-jwt
+   supabase functions deploy second-brain-mcp --no-verify-jwt
+   ```
+
+4. Delete the old key on OpenRouter.
+5. Verify: send a test thought in Slack and confirm the bot replies.
+
+### Rotate SLACK_BOT_TOKEN
+
+1. Go to [api.slack.com/apps](https://api.slack.com/apps) > your Second Brain app > **OAuth & Permissions**.
+2. Click **Reinstall to Workspace** to generate a new token.
+3. Copy the new `xoxb-` token.
+4. Update the Supabase secret:
+
+   ```bash
+   supabase secrets set SLACK_BOT_TOKEN=xoxb-your-new-token-here
+   ```
+
+5. Redeploy the ingest function:
+
+   ```bash
+   supabase functions deploy ingest-thought --no-verify-jwt
+   ```
+
+6. Verify: send a test thought in Slack and confirm the bot replies.
